@@ -14,7 +14,7 @@ jobs:
     # Only run on actual repository_dispatch events (not push/PR)
     if: github.event_name == 'repository_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -50,7 +50,7 @@ jobs:
           # Run Claude Code with JSON output to capture usage stats
           # --output-format json returns { result, usage, session_id, ... }
           # stderr separated to keep JSON clean on stdout
-          claude -p --output-format json --model ${{ github.event.client_payload.model || 'claude-opus-4-6' }} \
+          claude -p --output-format json --model ${{ github.event.client_payload.model || 'opus' }} \
             --dangerously-skip-permissions "$(cat /tmp/prompt.txt)" \
             > /tmp/output.json 2>/tmp/claude_stderr.txt || true
 
@@ -146,7 +146,7 @@ jobs:
                 input_tokens: $input_tokens,
                 output_tokens: $output_tokens,
                 cost_usd: $cost_usd,
-                model: "${{ github.event.client_payload.model || 'claude-opus-4-6' }}"
+                model: "${{ github.event.client_payload.model || 'opus' }}"
               }
             }' > /tmp/payload.json
 
