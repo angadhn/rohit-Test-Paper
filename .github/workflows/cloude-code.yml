@@ -53,7 +53,7 @@ jobs:
 
           # Run Claude Code and capture output
           # --dangerously-skip-permissions allows creating new files (safe since changes go through PR review)
-          claude --print --model claude-opus-4-20250514 --dangerously-skip-permissions "$(cat /tmp/prompt.txt)" 2>&1 | tee /tmp/claude_output.txt
+          claude --print --model ${{ github.event.client_payload.model || 'claude-opus-4-6' }} --dangerously-skip-permissions "$(cat /tmp/prompt.txt)" 2>&1 | tee /tmp/claude_output.txt
 
           # Save summary for PR body
           echo "summary<<EOF" >> $GITHUB_OUTPUT
