@@ -14,7 +14,7 @@ jobs:
     # Only run on actual repository_dispatch events (not push/PR)
     if: github.event_name == 'repository_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
