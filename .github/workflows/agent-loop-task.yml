@@ -207,11 +207,18 @@ jobs:
           OT=$(jq -r '.usage.output_tokens // 0' /tmp/output.json 2>/dev/null || echo 0)
           CU=$(jq -r '.total_cost_usd // 0' /tmp/output.json 2>/dev/null || echo 0)
 
+          # Get last meaningful commit message (skip safety commits)
+          LAST_COMMIT=$(git log -1 --format=%s 2>/dev/null || echo "")
+          if [[ "$LAST_COMMIT" == auto-save:* ]]; then
+            LAST_COMMIT=$(git log --format=%s -2 2>/dev/null | tail -1 || echo "")
+          fi
+
           # Build JSON payload to file (byte-identical for HMAC and curl)
           jq -nc \
             --arg task_id "$TASK_ID" \
             --arg branch "$BRANCH" \
             --arg has_safety_commit "$HAS_SAFETY_COMMIT" \
+            --arg last_commit "$LAST_COMMIT" \
             --argjson input_tokens "${IT}" \
             --argjson output_tokens "${OT}" \
             --argjson cost_usd "${CU}" \
@@ -223,6 +230,7 @@ jobs:
               timed_out: true,
               branch: $branch,
               has_safety_commit: ($has_safety_commit == "true"),
+              last_commit: $last_commit,
               usage: {
                 input_tokens: $input_tokens,
                 output_tokens: $output_tokens,
