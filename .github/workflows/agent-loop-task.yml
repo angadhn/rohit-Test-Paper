@@ -203,9 +203,13 @@ jobs:
           HAS_SAFETY_COMMIT: ${{ steps.safety_commit.outputs.has_safety_commit }}
         run: |
           # Try to extract usage from output.json (CLI may have written partial output before kill)
-          IT=$(jq -r '.usage.input_tokens // 0' /tmp/output.json 2>/dev/null || echo 0)
-          OT=$(jq -r '.usage.output_tokens // 0' /tmp/output.json 2>/dev/null || echo 0)
-          CU=$(jq -r '.total_cost_usd // 0' /tmp/output.json 2>/dev/null || echo 0)
+          # Sanitize: ensure values are valid integers/numbers for --argjson (default to 0)
+          RAW_IT=$(jq -r '.usage.input_tokens // 0' /tmp/output.json 2>/dev/null || echo 0)
+          RAW_OT=$(jq -r '.usage.output_tokens // 0' /tmp/output.json 2>/dev/null || echo 0)
+          RAW_CU=$(jq -r '.total_cost_usd // 0' /tmp/output.json 2>/dev/null || echo 0)
+          IT=$(echo "$RAW_IT" | grep -E '^[0-9]+$' || echo 0)
+          OT=$(echo "$RAW_OT" | grep -E '^[0-9]+$' || echo 0)
+          CU=$(echo "$RAW_CU" | grep -E '^[0-9]*\.?[0-9]+$' || echo 0)
 
           # Get last meaningful commit message (skip safety commits)
           LAST_COMMIT=$(git log -1 --format=%s 2>/dev/null || echo "")
@@ -219,9 +223,9 @@ jobs:
             --arg branch "$BRANCH" \
             --arg has_safety_commit "$HAS_SAFETY_COMMIT" \
             --arg last_commit "$LAST_COMMIT" \
-            --argjson input_tokens "${IT}" \
-            --argjson output_tokens "${OT}" \
-            --argjson cost_usd "${CU}" \
+            --argjson input_tokens "${IT:-0}" \
+            --argjson output_tokens "${OT:-0}" \
+            --argjson cost_usd "${CU:-0}" \
             '{
               task_id: $task_id,
               response: "Iteration timed out. Work committed to branch. Auto-continuing with fresh context.",
