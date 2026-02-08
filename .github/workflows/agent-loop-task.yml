@@ -191,3 +191,35 @@ jobs:
             --data-binary @/tmp/payload.json || true
 
           echo "Notified webhook of failure"
+
+      - name: Notify Webhook - Cancelled/Timeout
+        if: cancelled()
+        env:
+          WEBHOOK_URL: ${{ github.event.client_payload.webhook_url }}
+          WEBHOOK_SECRET: ${{ secrets.HOWLER_AGENT_WEBHOOK_SECRET }}
+          TASK_ID: ${{ github.event.client_payload.task_id }}
+          BRANCH: ${{ steps.safety_commit.outputs.branch }}
+          HAS_SAFETY_COMMIT: ${{ steps.safety_commit.outputs.has_safety_commit }}
+        run: |
+          # Build JSON payload to file (byte-identical for HMAC and curl)
+          jq -nc \
+            --arg task_id "$TASK_ID" \
+            --arg branch "$BRANCH" \
+            --arg has_safety_commit "$HAS_SAFETY_COMMIT" \
+            '{
+              task_id: $task_id,
+              response: "GitHub Action was cancelled (likely timed out). Work committed to branch is preserved. Use Continue Research to pick up where it left off.",
+              status: "failure",
+              source: "github",
+              branch: $branch,
+              has_safety_commit: ($has_safety_commit == "true")
+            }' > /tmp/payload.json
+
+          SIGNATURE=$(openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" /tmp/payload.json | awk '{print $NF}')
+
+          curl -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: sha256=$SIGNATURE" \
+            --data-binary @/tmp/payload.json || true
+
+          echo "Notified webhook of cancellation/timeout"
