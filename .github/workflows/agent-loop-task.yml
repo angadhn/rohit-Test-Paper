@@ -179,6 +179,7 @@ jobs:
               response: "GitHub Action failed. Check workflow logs for details.",
               status: "failure",
               source: "github",
+              timed_out: true,
               branch: $branch,
               has_safety_commit: ($has_safety_commit == "true")
             }' > /tmp/payload.json
@@ -208,9 +209,10 @@ jobs:
             --arg has_safety_commit "$HAS_SAFETY_COMMIT" \
             '{
               task_id: $task_id,
-              response: "GitHub Action was cancelled (likely timed out). Work committed to branch is preserved. Use Continue Research to pick up where it left off.",
+              response: "Iteration timed out. Work committed to branch. Auto-continuing with fresh context.",
               status: "failure",
               source: "github",
+              timed_out: true,
               branch: $branch,
               has_safety_commit: ($has_safety_commit == "true")
             }' > /tmp/payload.json
