@@ -50,8 +50,14 @@ jobs:
           # Run Claude Code with JSON output to capture usage stats
           # --output-format json returns { result, usage, session_id, ... }
           # stderr separated to keep JSON clean on stdout
-          claude -p --output-format json --model ${{ github.event.client_payload.model || 'opus' }} \
-            --dangerously-skip-permissions "$(cat /tmp/prompt.txt)" \
+          # Build disallowedTools flag if set (prevents orchestrators from using inline sub-agents)
+          DISALLOWED_TOOLS_FLAG=""
+          if [ -n "${{ github.event.client_payload.disallowed_tools }}" ]; then
+            DISALLOWED_TOOLS_FLAG="--disallowedTools ${{ github.event.client_payload.disallowed_tools }}"
+          fi
+
+          claude -p --output-format json --model ${{ github.event.client_payload.model || 'claude-opus-4-6' }} \
+            --dangerously-skip-permissions $DISALLOWED_TOOLS_FLAG "$(cat /tmp/prompt.txt)" \
             > /tmp/output.json 2>/tmp/claude_stderr.txt || true
 
           # Extract text response from JSON (fallback to raw file if JSON parsing fails)
@@ -68,9 +74,60 @@ jobs:
           cat /tmp/output.txt >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-          # Extract usage stats for webhook (default to 0 if unavailable)
-          echo "input_tokens=$(jq -r '.usage.input_tokens // 0' /tmp/output.json 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
-          echo "output_tokens=$(jq -r '.usage.output_tokens // 0' /tmp/output.json 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+      # Extract accurate token usage from Claude Code's session JSONL logs.
+      # The JSONL file is written incrementally, so it survives timeouts/kills.
+      # Each assistant message has per-API-call usage with cache breakdowns.
+      # This step runs ALWAYS (even on timeout) to capture usage from killed sessions.
+      - name: Extract Session Usage
+        if: always()
+        id: usage
+        run: |
+          # Find the JSONL session file created during this run
+          # Use -newer to only find files created after our prompt (avoids stale files)
+          JSONL=$(find ~/.claude/projects/ -name "*.jsonl" -newer /tmp/prompt.txt 2>/dev/null | head -1)
+
+          if [ -n "$JSONL" ] && [ -f "$JSONL" ]; then
+            echo "Found session JSONL: $JSONL"
+
+            # Sum all token types across all API calls in the session
+            # input_tokens = non-cached new tokens
+            # cache_creation_input_tokens = tokens written to cache
+            # cache_read_input_tokens = tokens served from cache
+            # Total input = all three combined (what was actually processed)
+            USAGE=$(cat "$JSONL" | jq -c 'select(.type == "assistant") | .message.usage // empty' 2>/dev/null | jq -s '{
+              input_tokens: (([.[].input_tokens // 0] | add) + ([.[].cache_creation_input_tokens // 0] | add) + ([.[].cache_read_input_tokens // 0] | add)),
+              output_tokens: ([.[].output_tokens // 0] | add),
+              cache_read_tokens: ([.[].cache_read_input_tokens // 0] | add),
+              cache_creation_tokens: ([.[].cache_creation_input_tokens // 0] | add),
+              num_api_calls: length
+            }' 2>/dev/null)
+
+            if [ -n "$USAGE" ] && [ "$USAGE" != "null" ]; then
+              echo "input_tokens=$(echo "$USAGE" | jq -r '.input_tokens // 0')" >> $GITHUB_OUTPUT
+              echo "output_tokens=$(echo "$USAGE" | jq -r '.output_tokens // 0')" >> $GITHUB_OUTPUT
+              echo "cache_read_tokens=$(echo "$USAGE" | jq -r '.cache_read_tokens // 0')" >> $GITHUB_OUTPUT
+              echo "cache_creation_tokens=$(echo "$USAGE" | jq -r '.cache_creation_tokens // 0')" >> $GITHUB_OUTPUT
+              echo "num_api_calls=$(echo "$USAGE" | jq -r '.num_api_calls // 0')" >> $GITHUB_OUTPUT
+              echo "Session usage extracted from JSONL ($(echo "$USAGE" | jq -r '.num_api_calls') API calls)"
+            else
+              echo "Warning: Failed to parse JSONL usage, falling back to JSON output"
+              echo "input_tokens=0" >> $GITHUB_OUTPUT
+              echo "output_tokens=0" >> $GITHUB_OUTPUT
+              echo "cache_read_tokens=0" >> $GITHUB_OUTPUT
+              echo "cache_creation_tokens=0" >> $GITHUB_OUTPUT
+              echo "num_api_calls=0" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "Warning: No JSONL session file found, falling back to JSON output"
+            # Fallback: try to get from Claude Code JSON output (last-call only, but better than 0)
+            echo "input_tokens=$(jq -r '.usage.input_tokens // 0' /tmp/output.json 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+            echo "output_tokens=$(jq -r '.usage.output_tokens // 0' /tmp/output.json 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+            echo "cache_read_tokens=0" >> $GITHUB_OUTPUT
+            echo "cache_creation_tokens=0" >> $GITHUB_OUTPUT
+            echo "num_api_calls=0" >> $GITHUB_OUTPUT
+          fi
+
+          # Get total_cost_usd from Claude Code JSON output (accurate session cost)
           echo "cost_usd=$(jq -r '.total_cost_usd // 0' /tmp/output.json 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
 
       # CRITICAL: Safety commit for any uncommitted files
@@ -122,11 +179,15 @@ jobs:
           RESPONSE: ${{ steps.claude.outputs.response }}
           BRANCH: ${{ steps.safety_commit.outputs.branch }}
           HAS_SAFETY_COMMIT: ${{ steps.safety_commit.outputs.has_safety_commit }}
-          INPUT_TOKENS: ${{ steps.claude.outputs.input_tokens }}
-          OUTPUT_TOKENS: ${{ steps.claude.outputs.output_tokens }}
-          COST_USD: ${{ steps.claude.outputs.cost_usd }}
+          INPUT_TOKENS: ${{ steps.usage.outputs.input_tokens }}
+          OUTPUT_TOKENS: ${{ steps.usage.outputs.output_tokens }}
+          COST_USD: ${{ steps.usage.outputs.cost_usd }}
+          CACHE_READ_TOKENS: ${{ steps.usage.outputs.cache_read_tokens }}
+          CACHE_CREATION_TOKENS: ${{ steps.usage.outputs.cache_creation_tokens }}
         run: |
-          # Build JSON payload to file (byte-identical for HMAC and curl)
+          # Build JSON payload using jq (includes token usage from session JSONL)
+          # Write to file to ensure HMAC input and curl body are byte-identical
+          # (avoids bash expansion issues with $, backticks, etc. in response text)
           jq -nc \
             --arg task_id "$TASK_ID" \
             --arg response "$RESPONSE" \
@@ -135,6 +196,8 @@ jobs:
             --argjson input_tokens "${INPUT_TOKENS:-0}" \
             --argjson output_tokens "${OUTPUT_TOKENS:-0}" \
             --argjson cost_usd "${COST_USD:-0}" \
+            --argjson cache_read_tokens "${CACHE_READ_TOKENS:-0}" \
+            --argjson cache_creation_tokens "${CACHE_CREATION_TOKENS:-0}" \
             '{
               task_id: $task_id,
               response: $response,
@@ -146,7 +209,9 @@ jobs:
                 input_tokens: $input_tokens,
                 output_tokens: $output_tokens,
                 cost_usd: $cost_usd,
-                model: "${{ github.event.client_payload.model || 'opus' }}"
+                cache_read_tokens: $cache_read_tokens,
+                cache_creation_tokens: $cache_creation_tokens,
+                model: "${{ github.event.client_payload.model || 'claude-opus-4-6' }}"
               }
             }' > /tmp/payload.json
 
@@ -168,20 +233,37 @@ jobs:
           TASK_ID: ${{ github.event.client_payload.task_id }}
           BRANCH: ${{ steps.safety_commit.outputs.branch }}
           HAS_SAFETY_COMMIT: ${{ steps.safety_commit.outputs.has_safety_commit }}
+          INPUT_TOKENS: ${{ steps.usage.outputs.input_tokens }}
+          OUTPUT_TOKENS: ${{ steps.usage.outputs.output_tokens }}
+          COST_USD: ${{ steps.usage.outputs.cost_usd }}
+          CACHE_READ_TOKENS: ${{ steps.usage.outputs.cache_read_tokens }}
+          CACHE_CREATION_TOKENS: ${{ steps.usage.outputs.cache_creation_tokens }}
         run: |
           # Build JSON payload to file (byte-identical for HMAC and curl)
           jq -nc \
             --arg task_id "$TASK_ID" \
             --arg branch "$BRANCH" \
             --arg has_safety_commit "$HAS_SAFETY_COMMIT" \
+            --argjson input_tokens "${INPUT_TOKENS:-0}" \
+            --argjson output_tokens "${OUTPUT_TOKENS:-0}" \
+            --argjson cost_usd "${COST_USD:-0}" \
+            --argjson cache_read_tokens "${CACHE_READ_TOKENS:-0}" \
+            --argjson cache_creation_tokens "${CACHE_CREATION_TOKENS:-0}" \
             '{
               task_id: $task_id,
               response: "GitHub Action failed. Check workflow logs for details.",
               status: "failure",
               source: "github",
-              timed_out: true,
               branch: $branch,
-              has_safety_commit: ($has_safety_commit == "true")
+              has_safety_commit: ($has_safety_commit == "true"),
+              usage: {
+                input_tokens: $input_tokens,
+                output_tokens: $output_tokens,
+                cost_usd: $cost_usd,
+                cache_read_tokens: $cache_read_tokens,
+                cache_creation_tokens: $cache_creation_tokens,
+                model: "${{ github.event.client_payload.model || 'claude-opus-4-6' }}"
+              }
             }' > /tmp/payload.json
 
           SIGNATURE=$(openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" /tmp/payload.json | awk '{print $NF}')
@@ -201,31 +283,22 @@ jobs:
           TASK_ID: ${{ github.event.client_payload.task_id }}
           BRANCH: ${{ steps.safety_commit.outputs.branch }}
           HAS_SAFETY_COMMIT: ${{ steps.safety_commit.outputs.has_safety_commit }}
+          INPUT_TOKENS: ${{ steps.usage.outputs.input_tokens }}
+          OUTPUT_TOKENS: ${{ steps.usage.outputs.output_tokens }}
+          COST_USD: ${{ steps.usage.outputs.cost_usd }}
+          CACHE_READ_TOKENS: ${{ steps.usage.outputs.cache_read_tokens }}
+          CACHE_CREATION_TOKENS: ${{ steps.usage.outputs.cache_creation_tokens }}
         run: |
-          # Try to extract usage from output.json (CLI may have written partial output before kill)
-          # Sanitize: ensure values are valid integers/numbers for --argjson (default to 0)
-          RAW_IT=$(jq -r '.usage.input_tokens // 0' /tmp/output.json 2>/dev/null || echo 0)
-          RAW_OT=$(jq -r '.usage.output_tokens // 0' /tmp/output.json 2>/dev/null || echo 0)
-          RAW_CU=$(jq -r '.total_cost_usd // 0' /tmp/output.json 2>/dev/null || echo 0)
-          IT=$(echo "$RAW_IT" | grep -E '^[0-9]+$' || echo 0)
-          OT=$(echo "$RAW_OT" | grep -E '^[0-9]+$' || echo 0)
-          CU=$(echo "$RAW_CU" | grep -E '^[0-9]*\.?[0-9]+$' || echo 0)
-
-          # Get last meaningful commit message (skip safety commits)
-          LAST_COMMIT=$(git log -1 --format=%s 2>/dev/null || echo "")
-          if [[ "$LAST_COMMIT" == auto-save:* ]]; then
-            LAST_COMMIT=$(git log --format=%s -2 2>/dev/null | tail -1 || echo "")
-          fi
-
           # Build JSON payload to file (byte-identical for HMAC and curl)
           jq -nc \
             --arg task_id "$TASK_ID" \
             --arg branch "$BRANCH" \
             --arg has_safety_commit "$HAS_SAFETY_COMMIT" \
-            --arg last_commit "$LAST_COMMIT" \
-            --argjson input_tokens "${IT:-0}" \
-            --argjson output_tokens "${OT:-0}" \
-            --argjson cost_usd "${CU:-0}" \
+            --argjson input_tokens "${INPUT_TOKENS:-0}" \
+            --argjson output_tokens "${OUTPUT_TOKENS:-0}" \
+            --argjson cost_usd "${COST_USD:-0}" \
+            --argjson cache_read_tokens "${CACHE_READ_TOKENS:-0}" \
+            --argjson cache_creation_tokens "${CACHE_CREATION_TOKENS:-0}" \
             '{
               task_id: $task_id,
               response: "Iteration timed out. Work committed to branch. Auto-continuing with fresh context.",
@@ -234,12 +307,13 @@ jobs:
               timed_out: true,
               branch: $branch,
               has_safety_commit: ($has_safety_commit == "true"),
-              last_commit: $last_commit,
               usage: {
                 input_tokens: $input_tokens,
                 output_tokens: $output_tokens,
                 cost_usd: $cost_usd,
-                model: "${{ github.event.client_payload.model || 'opus' }}"
+                cache_read_tokens: $cache_read_tokens,
+                cache_creation_tokens: $cache_creation_tokens,
+                model: "${{ github.event.client_payload.model || 'claude-opus-4-6' }}"
               }
             }' > /tmp/payload.json
 
