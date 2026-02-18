@@ -56,8 +56,8 @@ jobs:
             DISALLOWED_TOOLS_FLAG="--disallowedTools ${{ github.event.client_payload.disallowed_tools }}"
           fi
 
-          claude -p --output-format json --model ${{ github.event.client_payload.model || 'claude-opus-4-6' }} \
-            --dangerously-skip-permissions $DISALLOWED_TOOLS_FLAG "$(cat /tmp/prompt.txt)" \
+          cat /tmp/prompt.txt | claude -p --output-format json --model ${{ github.event.client_payload.model || 'claude-opus-4-6' }} \
+            --dangerously-skip-permissions $DISALLOWED_TOOLS_FLAG \
             > /tmp/output.json 2>/tmp/claude_stderr.txt || true
 
           # Extract text response from JSON (fallback to raw file if JSON parsing fails)
